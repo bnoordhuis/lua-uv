@@ -4,9 +4,6 @@
 /* when building c-ares library */
 #define CARES_BUILDING_LIBRARY 1
 
-/* when not building a shared library */
-#define CARES_STATICLIB 1
-
 /* Copyright (C) 2004 - 2008 by Daniel Stenberg et al
  *
  * Permission to use, copy, modify, and distribute this software and its
@@ -107,6 +104,9 @@
 
 /* Define if you have the strcasecmp function. */
 /* #define HAVE_STRCASECMP 1 */
+
+/* Define if you have the getenv function. */
+#define HAVE_GETENV 1
 
 /* Define if you have the strdup function. */
 #define HAVE_STRDUP 1

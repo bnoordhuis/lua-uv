@@ -30,9 +30,6 @@
 #include "internal.h"
 
 
-const uv_err_t uv_ok_ = { UV_OK, ERROR_SUCCESS };
-
-
 /*
  * Display an error message and abort the event loop.
  */
@@ -67,15 +64,10 @@ void uv_fatal_error(const int errorno, const char* syscall) {
 }
 
 
-uv_err_t uv_last_error(uv_loop_t* loop) {
-  return loop->last_error;
-}
-
-
 /* TODO: thread safety */
 static char* last_err_str_ = NULL;
 
-char* uv_strerror(uv_err_t err) {
+const char* uv_strerror(uv_err_t err) {
   if (last_err_str_ != NULL) {
     LocalFree(last_err_str_);
   }
@@ -98,8 +90,8 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case ERROR_SUCCESS:                     return UV_OK;
     case ERROR_FILE_NOT_FOUND:              return UV_ENOENT;
     case ERROR_PATH_NOT_FOUND:              return UV_ENOENT;
-    case ERROR_NOACCESS:                    return UV_EACCESS;
-    case WSAEACCES:                         return UV_EACCESS;
+    case ERROR_NOACCESS:                    return UV_EACCES;
+    case WSAEACCES:                         return UV_EACCES;
     case ERROR_ADDRESS_ALREADY_ASSOCIATED:  return UV_EADDRINUSE;
     case WSAEADDRINUSE:                     return UV_EADDRINUSE;
     case WSAEADDRNOTAVAIL:                  return UV_EADDRNOTAVAIL;
@@ -110,6 +102,8 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case WSAECONNABORTED:                   return UV_ECONNABORTED;
     case ERROR_CONNECTION_REFUSED:          return UV_ECONNREFUSED;
     case WSAECONNREFUSED:                   return UV_ECONNREFUSED;
+    case ERROR_NETNAME_DELETED:             return UV_ECONNRESET;
+    case WSAECONNRESET:                     return UV_ECONNRESET;
     case WSAEFAULT:                         return UV_EFAULT;
     case ERROR_HOST_UNREACHABLE:            return UV_EHOSTUNREACH;
     case WSAEHOSTUNREACH:                   return UV_EHOSTUNREACH;
@@ -132,26 +126,8 @@ uv_err_code uv_translate_sys_error(int sys_errno) {
     case ERROR_PIPE_BUSY:                   return UV_EBUSY;
     case ERROR_SEM_TIMEOUT:                 return UV_ETIMEDOUT;
     case ERROR_ALREADY_EXISTS:              return UV_EEXIST;
+    case WSAHOST_NOT_FOUND:                 return UV_ENOENT;
     default:                                return UV_UNKNOWN;
   }
 }
 
-
-uv_err_t uv_new_sys_error(int sys_errno) {
-  uv_err_t e;
-  e.code = uv_translate_sys_error(sys_errno);
-  e.sys_errno_ = sys_errno;
-  return e;
-}
-
-
-void uv_set_sys_error(uv_loop_t* loop, int sys_errno) {
-  loop->last_error.code = uv_translate_sys_error(sys_errno);
-  loop->last_error.sys_errno_ = sys_errno;
-}
-
-
-void uv_set_error(uv_loop_t* loop, uv_err_code code, int sys_errno) {
-  loop->last_error.code = code;
-  loop->last_error.sys_errno_ = sys_errno;
-}

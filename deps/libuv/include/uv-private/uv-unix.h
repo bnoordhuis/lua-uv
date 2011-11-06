@@ -29,10 +29,11 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <termios.h>
 
 /* Note: May be cast to struct iovec. See writev(2). */
 typedef struct {
@@ -41,6 +42,10 @@ typedef struct {
 } uv_buf_t;
 
 typedef int uv_file;
+
+/* Platform-specific definitions for uv_dlopen support. */
+typedef void* uv_lib_t;
+#define UV_DYNAMIC /* empty */
 
 #define UV_LOOP_PRIVATE_FIELDS \
   ares_channel channel; \
@@ -90,8 +95,6 @@ typedef int uv_file;
 
 
 #define UV_STREAM_PRIVATE_FIELDS \
-  uv_read_cb read_cb; \
-  uv_alloc_cb alloc_cb; \
   uv_connect_t *connect_req; \
   uv_shutdown_t *shutdown_req; \
   ev_io read_watcher; \
@@ -100,7 +103,8 @@ typedef int uv_file;
   ngx_queue_t write_completed_queue; \
   int delayed_error; \
   uv_connection_cb connection_cb; \
-  int accepted_fd;
+  int accepted_fd; \
+  int blocking;
 
 
 /* UV_TCP */
@@ -174,6 +178,42 @@ typedef int uv_file;
 #define UV_WORK_PRIVATE_FIELDS \
   eio_req* eio;
 
-#define UV_TTY_PRIVATE_FIELDS /* empty */
+#define UV_TTY_PRIVATE_FIELDS \
+  struct termios orig_termios; \
+  int mode;
+
+/* UV_FS_EVENT_PRIVATE_FIELDS */
+#if defined(__linux__)
+
+#define UV_FS_EVENT_PRIVATE_FIELDS \
+  ev_io read_watcher; \
+  uv_fs_event_cb cb; \
+
+#elif (defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1060) \
+  || defined(__FreeBSD__) \
+  || defined(__OpenBSD__) \
+  || defined(__NetBSD__)
+
+#define UV_FS_EVENT_PRIVATE_FIELDS \
+  ev_io event_watcher; \
+  uv_fs_event_cb cb; \
+  int fflags; \
+
+#elif defined(__sun)
+
+#include <sys/port.h>
+#include <port.h>
+
+#define UV_FS_EVENT_PRIVATE_FIELDS \
+  ev_io event_watcher; \
+  uv_fs_event_cb cb; \
+  file_obj_t fo; \
+
+#else
+
+/* Stub for platforms where the file watcher isn't implemented yet. */
+#define UV_FS_EVENT_PRIVATE_FIELDS
+
+#endif
 
 #endif /* UV_UNIX_H */

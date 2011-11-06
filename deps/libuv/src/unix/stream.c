@@ -29,6 +29,8 @@
 #include <string.h>
 #include <sys/uio.h>
 
+#include <stdio.h>
+
 
 static void uv__stream_connect(uv_stream_t*);
 static void uv__write(uv_stream_t* stream);
@@ -51,6 +53,7 @@ void uv__stream_init(uv_loop_t* loop,
                      uv_stream_t* stream,
                      uv_handle_type type) {
   uv__handle_init(loop, (uv_handle_t*)stream, type);
+  loop->counters.stream_init++;
 
   stream->alloc_cb = NULL;
   stream->close_cb = NULL;
@@ -59,6 +62,7 @@ void uv__stream_init(uv_loop_t* loop,
   stream->accepted_fd = -1;
   stream->fd = -1;
   stream->delayed_error = 0;
+  stream->blocking = 0;
   ngx_queue_init(&stream->write_queue);
   ngx_queue_init(&stream->write_completed_queue);
   stream->write_queue_size = 0;
@@ -81,14 +85,26 @@ int uv__stream_open(uv_stream_t* stream, int fd, int flags) {
   assert(fd >= 0);
   stream->fd = fd;
 
-  ((uv_handle_t*)stream)->flags |= flags;
+  stream->flags |= flags;
 
-  /* Reuse the port address if applicable. */
-  yes = 1;
-  if (stream->type == UV_TCP
-      && setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-    uv_err_new(stream->loop, errno);
-    return -1;
+  if (stream->type == UV_TCP) {
+    /* Reuse the port address if applicable. */
+    yes = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes) == -1) {
+      uv__set_sys_error(stream->loop, errno);
+      return -1;
+    }
+
+    if ((stream->flags & UV_TCP_NODELAY) &&
+        uv__tcp_nodelay((uv_tcp_t*)stream, 1)) {
+      return -1;
+    }
+
+    /* TODO Use delay the user passed in. */
+    if ((stream->flags & UV_TCP_KEEPALIVE) &&
+        uv__tcp_keepalive((uv_tcp_t*)stream, 1, 60)) {
+      return -1;
+    }
   }
 
   /* Associate the fd with each ev_io watcher. */
@@ -118,7 +134,7 @@ void uv__stream_destroy(uv_stream_t* stream) {
       free(req->bufs);
 
     if (req->cb) {
-      uv_err_new_artificial(req->handle->loop, UV_EINTR);
+      uv__set_artificial_error(req->handle->loop, UV_EINTR);
       req->cb(req, -1);
     }
   }
@@ -129,7 +145,7 @@ void uv__stream_destroy(uv_stream_t* stream) {
 
     req = ngx_queue_data(q, uv_write_t, queue);
     if (req->cb) {
-      uv_err_new_artificial(stream->loop, req->error);
+      uv__set_artificial_error(stream->loop, req->error);
       req->cb(req, req->error ? -1 : 0);
     }
   }
@@ -167,7 +183,7 @@ void uv__server_io(EV_P_ ev_io* watcher, int revents) {
         /* TODO special trick. unlock reserved socket, accept, close. */
         return;
       } else {
-        uv_err_new(stream->loop, errno);
+        uv__set_sys_error(stream->loop, errno);
         stream->connection_cb((uv_stream_t*)stream, -1);
       }
     } else {
@@ -199,15 +215,15 @@ int uv_accept(uv_stream_t* server, uv_stream_t* client) {
   streamClient = (uv_stream_t*)client;
 
   if (streamServer->accepted_fd < 0) {
-    uv_err_new(server->loop, EAGAIN);
+    uv__set_sys_error(server->loop, EAGAIN);
     goto out;
   }
 
   if (uv__stream_open(streamClient, streamServer->accepted_fd,
         UV_READABLE | UV_WRITABLE)) {
     /* TODO handle error */
-    streamServer->accepted_fd = -1;
     uv__close(streamServer->accepted_fd);
+    streamServer->accepted_fd = -1;
     goto out;
   }
 
@@ -272,12 +288,12 @@ static void uv__drain(uv_stream_t* stream) {
 
     if (shutdown(stream->fd, SHUT_WR)) {
       /* Error. Report it. User should call uv_close(). */
-      uv_err_new(stream->loop, errno);
+      uv__set_sys_error(stream->loop, errno);
       if (req->cb) {
         req->cb(req, -1);
       }
     } else {
-      uv_err_new(stream->loop, 0);
+      uv__set_sys_error(stream->loop, 0);
       ((uv_handle_t*) stream)->flags |= UV_SHUT;
       if (req->cb) {
         req->cb(req, 0);
@@ -325,9 +341,9 @@ static void uv__write(uv_stream_t* stream) {
   int iovcnt;
   ssize_t n;
 
-  assert(stream->fd >= 0);
+start:
 
-  /* TODO: should probably while(1) here until EAGAIN */
+  assert(stream->fd >= 0);
 
   /* Get the request at the head of the queue. */
   req = uv_write_queue_head(stream);
@@ -338,25 +354,56 @@ static void uv__write(uv_stream_t* stream) {
 
   assert(req->handle == stream);
 
-  /* Cast to iovec. We had to have our own uv_buf_t instead of iovec
+  /*
+   * Cast to iovec. We had to have our own uv_buf_t instead of iovec
    * because Windows's WSABUF is not an iovec.
    */
   assert(sizeof(uv_buf_t) == sizeof(struct iovec));
   iov = (struct iovec*) &(req->bufs[req->write_index]);
   iovcnt = req->bufcnt - req->write_index;
 
-  /* Now do the actual writev. Note that we've been updating the pointers
+  /*
+   * Now do the actual writev. Note that we've been updating the pointers
    * inside the iov each time we write. So there is no need to offset it.
    */
 
-  do {
-    if (iovcnt == 1) {
-      n = write(stream->fd, iov[0].iov_base, iov[0].iov_len);
-    } else {
-      n = writev(stream->fd, iov, iovcnt);
+  if (req->send_handle) {
+    struct msghdr msg;
+    char scratch[64];
+    struct cmsghdr *cmsg;
+    int fd_to_send = req->send_handle->fd;
+
+    assert(fd_to_send >= 0);
+
+    msg.msg_name = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = iovcnt;
+    msg.msg_flags = 0;
+
+    msg.msg_control = (void*) scratch;
+    msg.msg_controllen = CMSG_LEN(sizeof(fd_to_send));
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = msg.msg_controllen;
+    *(int*) CMSG_DATA(cmsg) = fd_to_send;
+
+    do {
+      n = sendmsg(stream->fd, &msg, 0);
     }
+    while (n == -1 && errno == EINTR);
+  } else {
+    do {
+      if (iovcnt == 1) {
+        n = write(stream->fd, iov[0].iov_base, iov[0].iov_len);
+      } else {
+        n = writev(stream->fd, iov, iovcnt);
+      }
+    }
+    while (n == -1 && errno == EINTR);
   }
-  while (n == -1 && errno == EINTR);
 
   if (n < 0) {
     if (errno != EAGAIN) {
@@ -365,6 +412,9 @@ static void uv__write(uv_stream_t* stream) {
       stream->write_queue_size -= uv__write_req_size(req);
       uv__write_req_finish(req);
       return;
+    } else if (stream->blocking) {
+      /* If this is a blocking stream, try again. */
+      goto start;
     }
   } else {
     /* Successful write */
@@ -382,8 +432,17 @@ static void uv__write(uv_stream_t* stream) {
         stream->write_queue_size -= n;
         n = 0;
 
-        /* There is more to write. Break and ensure the watcher is pending. */
-        break;
+        /* There is more to write. */
+        if (stream->blocking) {
+          /*
+           * If we're blocking then we should not be enabling the write
+           * watcher - instead we need to try again.
+           */
+          goto start;
+        } else {
+          /* Break loop and ensure the watcher is pending. */
+          break;
+        }
 
       } else {
         /* Finished writing the buf at index req->write_index. */
@@ -409,6 +468,9 @@ static void uv__write(uv_stream_t* stream) {
   /* Either we've counted n down to zero or we've got EAGAIN. */
   assert(n == 0 || n == -1);
 
+  /* Only non-blocking streams should use the write_watcher. */
+  assert(!stream->blocking);
+
   /* We're not done. */
   ev_io_start(stream->loop->ev, &stream->write_watcher);
 }
@@ -428,7 +490,7 @@ static void uv__write_callbacks(uv_stream_t* stream) {
 
     /* NOTE: call callback AFTER freeing the request data. */
     if (req->cb) {
-      uv_err_new_artificial(stream->loop, req->error);
+      uv__set_artificial_error(stream->loop, req->error);
       req->cb(req, req->error ? -1 : 0);
     }
 
@@ -447,12 +509,16 @@ static void uv__write_callbacks(uv_stream_t* stream) {
 static void uv__read(uv_stream_t* stream) {
   uv_buf_t buf;
   ssize_t nread;
+  struct msghdr msg;
+  struct cmsghdr* cmsg;
+  char cmsg_space[64];
   struct ev_loop* ev = stream->loop->ev;
 
   /* XXX: Maybe instead of having UV_READING we just test if
    * tcp->read_cb is NULL or not?
    */
-  while (stream->read_cb && ((uv_handle_t*)stream)->flags & UV_READING) {
+  while ((stream->read_cb || stream->read2_cb) &&
+         stream->flags & UV_READING) {
     assert(stream->alloc_cb);
     buf = stream->alloc_cb((uv_handle_t*)stream, 64 * 1024);
 
@@ -460,10 +526,29 @@ static void uv__read(uv_stream_t* stream) {
     assert(buf.base);
     assert(stream->fd >= 0);
 
-    do {
-      nread = read(stream->fd, buf.base, buf.len);
+    if (stream->read_cb) {
+      do {
+        nread = read(stream->fd, buf.base, buf.len);
+      }
+      while (nread < 0 && errno == EINTR);
+    } else {
+      assert(stream->read2_cb);
+      /* read2_cb uses recvmsg */
+      msg.msg_flags = 0;
+      msg.msg_iov = (struct iovec*) &buf;
+      msg.msg_iovlen = 1;
+      msg.msg_name = NULL;
+      msg.msg_namelen = 0;
+      /* Set up to receive a descriptor even if one isn't in the message */
+      msg.msg_controllen = 64;
+      msg.msg_control = (void *) cmsg_space;
+
+      do {
+        nread = recvmsg(stream->fd, &msg, 0);
+      }
+      while (nread < 0 && errno == EINTR);
     }
-    while (nread < 0 && errno == EINTR);
+
 
     if (nread < 0) {
       /* Error */
@@ -472,25 +557,85 @@ static void uv__read(uv_stream_t* stream) {
         if (stream->flags & UV_READING) {
           ev_io_start(ev, &stream->read_watcher);
         }
-        uv_err_new(stream->loop, EAGAIN);
-        stream->read_cb(stream, 0, buf);
+        uv__set_sys_error(stream->loop, EAGAIN);
+
+        if (stream->read_cb) {
+          stream->read_cb(stream, 0, buf);
+        } else {
+          stream->read2_cb((uv_pipe_t*)stream, 0, buf, UV_UNKNOWN_HANDLE);
+        }
+
         return;
       } else {
         /* Error. User should call uv_close(). */
-        uv_err_new(stream->loop, errno);
-        stream->read_cb(stream, -1, buf);
+        uv__set_sys_error(stream->loop, errno);
+
+        if (stream->read_cb) {
+          stream->read_cb(stream, -1, buf);
+        } else {
+          stream->read2_cb((uv_pipe_t*)stream, -1, buf, UV_UNKNOWN_HANDLE);
+        }
+
         assert(!ev_is_active(&stream->read_watcher));
         return;
       }
+
     } else if (nread == 0) {
       /* EOF */
-      uv_err_new_artificial(stream->loop, UV_EOF);
+      uv__set_artificial_error(stream->loop, UV_EOF);
       ev_io_stop(ev, &stream->read_watcher);
-      stream->read_cb(stream, -1, buf);
+
+      if (stream->read_cb) {
+        stream->read_cb(stream, -1, buf);
+      } else {
+        stream->read2_cb((uv_pipe_t*)stream, -1, buf, UV_UNKNOWN_HANDLE);
+      }
       return;
     } else {
       /* Successful read */
-      stream->read_cb(stream, nread, buf);
+      ssize_t buflen = buf.len;
+
+      if (stream->read_cb) {
+        stream->read_cb(stream, nread, buf);
+      } else {
+        assert(stream->read2_cb);
+
+        /*
+         * XXX: Some implementations can send multiple file descriptors in a
+         * single message. We should be using CMSG_NXTHDR() to walk the
+         * chain to get at them all. This would require changing the API to
+         * hand these back up the caller, is a pain.
+         */
+
+        for (cmsg = CMSG_FIRSTHDR(&msg);
+             msg.msg_controllen > 0 && cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+
+          if (cmsg->cmsg_type == SCM_RIGHTS) {
+            if (stream->accepted_fd != -1) {
+              fprintf(stderr, "(libuv) ignoring extra FD received\n");
+            }
+
+            stream->accepted_fd = *(int *) CMSG_DATA(cmsg);
+
+          } else {
+            fprintf(stderr, "ignoring non-SCM_RIGHTS ancillary data: %d\n",
+                cmsg->cmsg_type);
+          }
+        }
+
+
+        if (stream->accepted_fd >= 0) {
+          stream->read2_cb((uv_pipe_t*)stream, nread, buf, UV_TCP);
+        } else {
+          stream->read2_cb((uv_pipe_t*)stream, nread, buf, UV_UNKNOWN_HANDLE);
+        }
+      }
+
+      /* Return if we didn't fill the buffer, there is no more data to read. */
+      if (nread < buflen) {
+        return;
+      }
     }
   }
 }
@@ -505,7 +650,7 @@ int uv_shutdown(uv_shutdown_t* req, uv_stream_t* stream, uv_shutdown_cb cb) {
       stream->flags & UV_SHUT ||
       stream->flags & UV_CLOSED ||
       stream->flags & UV_CLOSING) {
-    uv_err_new(stream->loop, EINVAL);
+    uv__set_sys_error(stream->loop, EINVAL);
     return -1;
   }
 
@@ -529,8 +674,8 @@ int uv_shutdown(uv_shutdown_t* req, uv_stream_t* stream, uv_shutdown_cb cb) {
 void uv__stream_io(EV_P_ ev_io* watcher, int revents) {
   uv_stream_t* stream = watcher->data;
 
-  assert(stream->type == UV_TCP ||
-         stream->type == UV_NAMED_PIPE);
+  assert(stream->type == UV_TCP || stream->type == UV_NAMED_PIPE ||
+      stream->type == UV_TTY);
   assert(watcher == &stream->read_watcher ||
          watcher == &stream->write_watcher);
   assert(!(stream->flags & UV_CLOSING));
@@ -593,7 +738,7 @@ static void uv__stream_connect(uv_stream_t* stream) {
     return;
   } else {
     /* Error */
-    uv_err_new(stream->loop, error);
+    uv__set_sys_error(stream->loop, error);
 
     stream->connect_req = NULL;
     if (req->cb) {
@@ -610,7 +755,7 @@ int uv__connect(uv_connect_t* req, uv_stream_t* stream, struct sockaddr* addr,
 
   if (stream->fd <= 0) {
     if ((sockfd = uv__socket(addr->sa_family, SOCK_STREAM, 0)) == -1) {
-      uv_err_new(stream->loop, errno);
+      uv__set_sys_error(stream->loop, errno);
       return -1;
     }
 
@@ -627,12 +772,12 @@ int uv__connect(uv_connect_t* req, uv_stream_t* stream, struct sockaddr* addr,
   ngx_queue_init(&req->queue);
 
   if (stream->connect_req) {
-    uv_err_new(stream->loop, EALREADY);
+    uv__set_sys_error(stream->loop, EALREADY);
     return -1;
   }
 
   if (stream->type != UV_TCP) {
-    uv_err_new(stream->loop, ENOTSOCK);
+    uv__set_sys_error(stream->loop, ENOTSOCK);
     return -1;
   }
 
@@ -656,7 +801,7 @@ int uv__connect(uv_connect_t* req, uv_stream_t* stream, struct sockaddr* addr,
         break;
 
       default:
-        uv_err_new(stream->loop, errno);
+        uv__set_sys_error(stream->loop, errno);
         return -1;
     }
   }
@@ -672,19 +817,24 @@ int uv__connect(uv_connect_t* req, uv_stream_t* stream, struct sockaddr* addr,
 }
 
 
-/* The buffers to be written must remain valid until the callback is called.
- * This is not required for the uv_buf_t array.
- */
-int uv_write(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
-    uv_write_cb cb) {
+int uv_write2(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
+    uv_stream_t* send_handle, uv_write_cb cb) {
   int empty_queue;
 
-  assert((stream->type == UV_TCP || stream->type == UV_NAMED_PIPE)
-      && "uv_write (unix) does not yet support other types of streams");
+  assert((stream->type == UV_TCP || stream->type == UV_NAMED_PIPE ||
+      stream->type == UV_TTY) &&
+      "uv_write (unix) does not yet support other types of streams");
 
   if (stream->fd < 0) {
-    uv_err_new(stream->loop, EBADF);
+    uv__set_sys_error(stream->loop, EBADF);
     return -1;
+  }
+
+  if (send_handle) {
+    if (stream->type != UV_NAMED_PIPE || !((uv_pipe_t*)stream)->ipc) {
+      uv__set_sys_error(stream->loop, EOPNOTSUPP);
+      return -1;
+    }
   }
 
   empty_queue = (stream->write_queue_size == 0);
@@ -694,6 +844,7 @@ int uv_write(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
   req->cb = cb;
   req->handle = stream;
   req->error = 0;
+  req->send_handle = send_handle;
   req->type = UV_WRITE;
   ngx_queue_init(&req->queue);
 
@@ -729,6 +880,13 @@ int uv_write(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
   if (empty_queue) {
     uv__write(stream);
   } else {
+    /*
+     * blocking streams should never have anything in the queue.
+     * if this assert fires then somehow the blocking stream isn't being
+     * sufficently flushed in uv__write.
+     */
+    assert(!stream->blocking);
+
     ev_io_start(stream->loop->ev, &stream->write_watcher);
   }
 
@@ -736,11 +894,22 @@ int uv_write(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
 }
 
 
-int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb, uv_read_cb read_cb) {
-  assert(stream->type == UV_TCP || stream->type == UV_NAMED_PIPE);
+/* The buffers to be written must remain valid until the callback is called.
+ * This is not required for the uv_buf_t array.
+ */
+int uv_write(uv_write_t* req, uv_stream_t* stream, uv_buf_t bufs[], int bufcnt,
+    uv_write_cb cb) {
+  return uv_write2(req, stream, bufs, bufcnt, NULL, cb);
+}
+
+
+int uv__read_start_common(uv_stream_t* stream, uv_alloc_cb alloc_cb,
+    uv_read_cb read_cb, uv_read2_cb read2_cb) {
+  assert(stream->type == UV_TCP || stream->type == UV_NAMED_PIPE ||
+      stream->type == UV_TTY);
 
   if (stream->flags & UV_CLOSING) {
-    uv_err_new(stream->loop, EINVAL);
+    uv__set_sys_error(stream->loop, EINVAL);
     return -1;
   }
 
@@ -757,6 +926,7 @@ int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb, uv_read_cb read_cb)
   assert(alloc_cb);
 
   stream->read_cb = read_cb;
+  stream->read2_cb = read2_cb;
   stream->alloc_cb = alloc_cb;
 
   /* These should have been set by uv_tcp_init. */
@@ -767,14 +937,24 @@ int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb, uv_read_cb read_cb)
 }
 
 
+int uv_read_start(uv_stream_t* stream, uv_alloc_cb alloc_cb,
+    uv_read_cb read_cb) {
+  return uv__read_start_common(stream, alloc_cb, read_cb, NULL);
+}
+
+
+int uv_read2_start(uv_stream_t* stream, uv_alloc_cb alloc_cb,
+    uv_read2_cb read_cb) {
+  return uv__read_start_common(stream, alloc_cb, NULL, read_cb);
+}
+
+
 int uv_read_stop(uv_stream_t* stream) {
-  uv_tcp_t* tcp = (uv_tcp_t*)stream;
-
-  ((uv_handle_t*)tcp)->flags &= ~UV_READING;
-
-  ev_io_stop(tcp->loop->ev, &tcp->read_watcher);
-  tcp->read_cb = NULL;
-  tcp->alloc_cb = NULL;
+  ev_io_stop(stream->loop->ev, &stream->read_watcher);
+  stream->flags &= ~UV_READING;
+  stream->read_cb = NULL;
+  stream->read2_cb = NULL;
+  stream->alloc_cb = NULL;
   return 0;
 }
 

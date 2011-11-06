@@ -19,12 +19,19 @@
  */
 
 #include "uv.h"
+#include "internal.h"
 
+#include <assert.h>
 #include <stdint.h>
+#include <errno.h>
+
 #include <CoreServices/CoreServices.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h> /* _NSGetExecutablePath */
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+#include <unistd.h>  /* sysconf */
 
 
 uint64_t uv_hrtime() {
@@ -62,4 +69,40 @@ int uv_exepath(char* buffer, size_t* size) {
   free(fullpath);
   *size = strlen(buffer);
   return 0;
+}
+
+uint64_t uv_get_free_memory(void) {
+  vm_statistics_data_t info;
+  mach_msg_type_number_t count = sizeof(info) / sizeof(integer_t);
+
+  if (host_statistics(mach_host_self(), HOST_VM_INFO,
+                      (host_info_t)&info, &count) != KERN_SUCCESS) {
+    return -1;
+  }
+
+  return (uint64_t) info.free_count * sysconf(_SC_PAGESIZE);
+}
+
+uint64_t uv_get_total_memory(void) {
+  uint64_t info;
+  int which[] = {CTL_HW, HW_MEMSIZE};
+  size_t size = sizeof(info);
+
+  if (sysctl(which, 2, &info, &size, NULL, 0) < 0) {
+    return -1;
+  }
+
+  return (uint64_t) info;
+}
+
+void uv_loadavg(double avg[3]) {
+  struct loadavg info;
+  size_t size = sizeof(info);
+  int which[] = {CTL_VM, VM_LOADAVG};
+
+  if (sysctl(which, 2, &info, &size, NULL, 0) < 0) return;
+
+  avg[0] = (double) info.ldavg[0] / info.fscale;
+  avg[1] = (double) info.ldavg[1] / info.fscale;
+  avg[2] = (double) info.ldavg[2] / info.fscale;
 }

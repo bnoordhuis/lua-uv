@@ -204,16 +204,15 @@ static void pipe_pinger_new() {
   pinger->pongs = 0;
 
   /* Try to connec to the server and do NUM_PINGS ping-pongs. */
-  r = uv_pipe_init(uv_default_loop(), &pinger->stream.pipe);
+  r = uv_pipe_init(uv_default_loop(), &pinger->stream.pipe, 0);
   pinger->stream.pipe.data = pinger;
   ASSERT(!r);
 
   /* We are never doing multiple reads/connects at a time anyway. */
   /* so these handles can be pre-initialized. */
 
-  r = uv_pipe_connect(&pinger->connect_req, &pinger->stream.pipe, TEST_PIPENAME,
+  uv_pipe_connect(&pinger->connect_req, &pinger->stream.pipe, TEST_PIPENAME,
       pinger_on_connect);
-  ASSERT(!r);
 
   /* Synchronous connect callbacks are not allowed. */
   ASSERT(pinger_on_connect_count == 0);

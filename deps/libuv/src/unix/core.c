@@ -38,18 +38,22 @@
 #include <limits.h> /* PATH_MAX */
 #include <sys/uio.h> /* writev */
 
+#ifdef __linux__
+# include <sys/ioctl.h>
+#endif
+
 #ifdef __sun
 # include <sys/types.h>
 # include <sys/wait.h>
 #endif
 
-#if defined(__APPLE__)
-#include <mach-o/dyld.h> /* _NSGetExecutablePath */
+#ifdef __APPLE__
+# include <mach-o/dyld.h> /* _NSGetExecutablePath */
 #endif
 
-#if defined(__FreeBSD__)
-#include <sys/sysctl.h>
-#include <sys/wait.h>
+#ifdef __FreeBSD__
+# include <sys/sysctl.h>
+# include <sys/wait.h>
 #endif
 
 static uv_loop_t default_loop_struct;
@@ -79,6 +83,7 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
       uv_pipe_cleanup((uv_pipe_t*)handle);
       /* Fall through. */
 
+    case UV_TTY:
     case UV_TCP:
       stream = (uv_stream_t*)handle;
 
@@ -136,6 +141,10 @@ void uv_close(uv_handle_t* handle, uv_close_cb close_cb) {
       ev_child_stop(process->loop->ev, &process->child_watcher);
       break;
 
+    case UV_FS_EVENT:
+      uv__fs_event_destroy((uv_fs_event_t*)handle);
+      break;
+
     default:
       assert(0);
   }
@@ -167,7 +176,7 @@ void uv_loop_delete(uv_loop_t* loop) {
 uv_loop_t* uv_default_loop() {
   if (!default_loop_ptr) {
     default_loop_ptr = &default_loop_struct;
-#if defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 1060
+#if HAVE_KQUEUE
     default_loop_struct.ev = ev_default_loop(EVBACKEND_KQUEUE);
 #else
     default_loop_struct.ev = ev_default_loop(EVFLAG_AUTO);
@@ -231,6 +240,7 @@ void uv__finish_close(uv_handle_t* handle) {
 
     case UV_NAMED_PIPE:
     case UV_TCP:
+    case UV_TTY:
       assert(!ev_is_active(&((uv_stream_t*)handle)->read_watcher));
       assert(!ev_is_active(&((uv_stream_t*)handle)->write_watcher));
       assert(((uv_stream_t*)handle)->fd == -1);
@@ -246,6 +256,9 @@ void uv__finish_close(uv_handle_t* handle) {
 
     case UV_PROCESS:
       assert(!ev_is_active(&((uv_process_t*)handle)->child_watcher));
+      break;
+
+    case UV_FS_EVENT:
       break;
 
     default:
@@ -554,7 +567,7 @@ int uv_timer_stop(uv_timer_t* timer) {
 
 int uv_timer_again(uv_timer_t* timer) {
   if (!ev_is_active(&timer->timer_watcher)) {
-    uv_err_new(timer->loop, EINVAL);
+    uv__set_sys_error(timer->loop, EINVAL);
     return -1;
   }
 
@@ -575,6 +588,8 @@ int64_t uv_timer_get_repeat(uv_timer_t* timer) {
 
 static int uv_getaddrinfo_done(eio_req* req) {
   uv_getaddrinfo_t* handle = req->data;
+  struct addrinfo *res = handle->res;
+  handle->res = NULL;
 
   uv_unref(handle->loop);
 
@@ -582,15 +597,20 @@ static int uv_getaddrinfo_done(eio_req* req) {
   free(handle->service);
   free(handle->hostname);
 
-  if (handle->retcode != 0) {
-    /* TODO how to display gai error strings? */
-    uv_err_new(handle->loop, handle->retcode);
+  if (handle->retcode == 0) {
+    /* OK */
+#if EAI_NODATA /* FreeBSD deprecated EAI_NODATA */
+  } else if (handle->retcode == EAI_NONAME || handle->retcode == EAI_NODATA) {
+#else
+  } else if (handle->retcode == EAI_NONAME) {
+#endif
+    uv__set_sys_error(handle->loop, ENOENT); /* FIXME compatibility hack */
+  } else {
+    handle->loop->last_err.code = UV_EADDRINFO;
+    handle->loop->last_err.sys_errno_ = handle->retcode;
   }
 
-  handle->cb(handle, handle->retcode, handle->res);
-
-  freeaddrinfo(handle->res);
-  handle->res = NULL;
+  handle->cb(handle, handle->retcode, res);
 
   return 0;
 }
@@ -618,7 +638,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
 
   if (handle == NULL || cb == NULL ||
       (hostname == NULL && service == NULL)) {
-    uv_err_new_artificial(loop, UV_EINVAL);
+    uv__set_artificial_error(loop, UV_EINVAL);
     return -1;
   }
 
@@ -631,7 +651,10 @@ int uv_getaddrinfo(uv_loop_t* loop,
 
   if (hints) {
     handle->hints = malloc(sizeof(struct addrinfo));
-    memcpy(&handle->hints, hints, sizeof(struct addrinfo));
+    memcpy(handle->hints, hints, sizeof(struct addrinfo));
+  }
+  else {
+    handle->hints = NULL;
   }
 
   /* TODO security! check lengths, check return values. */
@@ -652,6 +675,12 @@ int uv_getaddrinfo(uv_loop_t* loop,
   assert(req->data == handle);
 
   return 0;
+}
+
+
+void uv_freeaddrinfo(struct addrinfo* ai) {
+  if (ai)
+    freeaddrinfo(ai);
 }
 
 
@@ -717,6 +746,9 @@ int uv__close(int fd) {
 
 
 int uv__nonblock(int fd, int set) {
+#if FIONBIO
+  return ioctl(fd, FIONBIO, &set);
+#else
   int flags;
 
   if ((flags = fcntl(fd, F_GETFL)) == -1) {
@@ -734,10 +766,17 @@ int uv__nonblock(int fd, int set) {
   }
 
   return 0;
+#endif
 }
 
 
 int uv__cloexec(int fd, int set) {
+#if __linux__
+  /* Linux knows only FD_CLOEXEC so we can safely omit the fcntl(F_GETFD)
+   * syscall. CHECKME: That's probably true for other Unices as well.
+   */
+  return fcntl(fd, F_SETFD, set ? FD_CLOEXEC : 0);
+#else
   int flags;
 
   if ((flags = fcntl(fd, F_GETFD)) == -1) {
@@ -755,6 +794,7 @@ int uv__cloexec(int fd, int set) {
   }
 
   return 0;
+#endif
 }
 
 
@@ -774,10 +814,3 @@ size_t uv__strlcpy(char* dst, const char* src, size_t size) {
 
   return src - org;
 }
-
-
-uv_stream_t* uv_std_handle(uv_loop_t* loop, uv_std_type type) {
-  assert(0 && "implement me");
-  return NULL;
-}
-

@@ -40,6 +40,10 @@ static uv_once_t uv_default_loop_init_guard_ = UV_ONCE_INIT;
 
 
 static void uv_init(void) {
+  /* Tell Windows that we will handle critical errors. */
+  SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+    SEM_NOOPENFILEERRORBOX);
+
   /* Initialize winsock */
   uv_winsock_init();
 
@@ -48,6 +52,9 @@ static void uv_init(void) {
 
   /* Initialize FS */
   uv_fs_init();
+
+  /* Initialize console */
+  uv_console_init();
 }
 
 
@@ -79,7 +86,7 @@ static void uv_loop_init(uv_loop_t* loop) {
   loop->ares_active_sockets = 0;
   loop->ares_chan = NULL;
 
-  loop->last_error = uv_ok_;
+  loop->last_err = uv_ok_;
 }
 
 
@@ -144,7 +151,7 @@ static void uv_poll_ex(uv_loop_t* loop, int block) {
   BOOL success;
   DWORD timeout;
   uv_req_t* req;
-  OVERLAPPED_ENTRY overlappeds[64];
+  OVERLAPPED_ENTRY overlappeds[128];
   ULONG count;
   ULONG i;
 

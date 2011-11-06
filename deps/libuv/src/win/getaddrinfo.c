@@ -216,12 +216,17 @@ complete:
   /* finally do callback with converted result */
   handle->getaddrinfo_cb(handle, uv_ret, (struct addrinfo*)alloc_ptr);
 
+  uv_unref(loop);
+}
+
+
+void uv_freeaddrinfo(struct addrinfo* ai) {
+  char* alloc_ptr = (char*)ai;
+
   /* release copied result memory */
   if (alloc_ptr != NULL) {
     free(alloc_ptr);
   }
-
-  uv_unref(loop);
 }
 
 
@@ -251,7 +256,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
 
   if (handle == NULL || getaddrinfo_cb == NULL ||
      (node == NULL && service == NULL)) {
-    uv_set_sys_error(loop, WSAEINVAL);
+    uv__set_sys_error(loop, WSAEINVAL);
     goto error;
   }
 
@@ -266,7 +271,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
   if (node != NULL) {
     nodesize = ALIGNED_SIZE(uv_utf8_to_utf16(node, NULL, 0) * sizeof(wchar_t));
     if (nodesize == 0) {
-      uv_set_sys_error(loop, GetLastError());
+      uv__set_sys_error(loop, GetLastError());
       goto error;
     }
   }
@@ -275,7 +280,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
     servicesize = ALIGNED_SIZE(uv_utf8_to_utf16(service, NULL, 0) *
                                sizeof(wchar_t));
     if (servicesize == 0) {
-      uv_set_sys_error(loop, GetLastError());
+      uv__set_sys_error(loop, GetLastError());
       goto error;
     }
   }
@@ -286,7 +291,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
   /* allocate memory for inputs, and partition it as needed */
   alloc_ptr = (char*)malloc(nodesize + servicesize + hintssize);
   if (!alloc_ptr) {
-    uv_set_sys_error(loop, WSAENOBUFS);
+    uv__set_sys_error(loop, WSAENOBUFS);
     goto error;
   }
 
@@ -300,7 +305,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
     if (uv_utf8_to_utf16(node,
                          (wchar_t*) alloc_ptr,
                          nodesize / sizeof(wchar_t)) == 0) {
-      uv_set_sys_error(loop, GetLastError());
+      uv__set_sys_error(loop, GetLastError());
       goto error;
     }
     alloc_ptr += nodesize;
@@ -315,7 +320,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
     if (uv_utf8_to_utf16(service,
                          (wchar_t*) alloc_ptr,
                          servicesize / sizeof(wchar_t)) == 0) {
-      uv_set_sys_error(loop, GetLastError());
+      uv__set_sys_error(loop, GetLastError());
       goto error;
     }
     alloc_ptr += servicesize;
@@ -347,7 +352,7 @@ int uv_getaddrinfo(uv_loop_t* loop,
   if (QueueUserWorkItem(&getaddrinfo_thread_proc,
                         handle,
                         WT_EXECUTELONGFUNCTION) == 0) {
-    uv_set_sys_error(loop, GetLastError());
+    uv__set_sys_error(loop, GetLastError());
     goto error;
   }
 
