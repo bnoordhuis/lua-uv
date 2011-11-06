@@ -1,7 +1,7 @@
 B ?= build
 
 CFLAGS = -pthread -Wall -Wextra -Wno-unused-parameter -Ideps/http_parser -Ideps/libuv/include
-LDFLAGS = -lpthread
+LDFLAGS = -lpthread -lrt
 
 LUA_DIR ?= /usr
 LUA_LIBDIR = $(LUA_DIR)/lib/lua/5.1
