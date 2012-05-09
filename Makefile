@@ -27,7 +27,7 @@ else
 	override CFLAGS += -O2 -DNDEBUG
 endif
 
-.PHONY:	prereqs clean
+.PHONY:	prereqs clean install
 
 OBJECTS = $(patsubst src/%.c,$(B)/%.o,$(SOURCES))
 
@@ -45,6 +45,10 @@ prereqs:
 
 clean:
 	rm -rf $(B)
+
+install:	$(B)/uv.so
+	mkdir -p $(LUA_LIBDIR)
+	cp $(B)/uv.so $(LUA_LIBDIR)
 
 deps/libuv/uv.a:
 	$(MAKE) -C deps/libuv CFLAGS+=-fPIC
